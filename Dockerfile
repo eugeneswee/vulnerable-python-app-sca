@@ -7,11 +7,16 @@ LABEL description="Vulnerable Python app for SCA testing"
 
 WORKDIR /app
 
-# Upgrade pip to avoid warnings
+# Install curl for health checks
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip to avoid warnings but pin to compatible version
 RUN pip install --upgrade pip==21.3.1
 
 # Copy requirements first for better layer caching
 COPY requirements.txt .
+
+# Install dependencies with specific versions to avoid conflicts
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
