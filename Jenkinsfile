@@ -63,10 +63,10 @@ pipeline {
                         
                         # Test application endpoints
                         echo "Testing application health endpoint..."
-                        curl -f http://localhost:5001/health || exit 1
+                        curl -f http://test-app-${BUILD_NUMBER}:5001/health || exit 1
                         
                         echo "Testing main endpoint..."
-                        curl -f http://localhost:5001/ || exit 1
+                        curl -f http://test-app-${BUILD_NUMBER}:5001/ || exit 1
                         
                         echo "Application tests passed!"
                     '''
