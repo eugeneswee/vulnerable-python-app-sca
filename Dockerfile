@@ -7,9 +7,6 @@ LABEL description="Vulnerable Python app for SCA testing"
 
 WORKDIR /app
 
-# Install curl for health checks
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
-
 # Upgrade pip to avoid warnings but pin to compatible version
 RUN pip install --upgrade pip==21.3.1
 
@@ -28,7 +25,7 @@ USER appuser
 
 EXPOSE 5001
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:5001/health || exit 1
+# Note: Health check removed due to Debian Buster EOL issues
+# The Jenkins pipeline test stage will verify application functionality
 
 CMD ["python", "app.py"]
