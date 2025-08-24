@@ -1,0 +1,19 @@
+# Snyk configuration file
+# https://docs.snyk.io/snyk-cli/test-for-vulnerabilities/the-.snyk-file
+
+version: v1.0.0
+
+# Ignore specific vulnerabilities (examples - remove if you want to see all issues)
+ignore:
+  # Example: Ignore a specific vulnerability in a specific package
+  # SNYK-PYTHON-FLASK-40138:
+  #   - '*':
+  #       reason: 'Acceptable risk for educational purposes'
+  #       expires: '2025-12-31T23:59:59.999Z'
+
+# Language settings
+language-settings:
+  python: '3.8'
+
+# Patches (if available)
+patches: {}

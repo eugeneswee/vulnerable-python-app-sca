@@ -3,6 +3,7 @@ pipeline {
     
     environment {
         TRIVY_VERSION = '0.45.0'
+        SNYK_IMAGE = 'snyk/snyk:alpine'
         APP_NAME = 'vulnerable-python-app'
         APP_VERSION = "${BUILD_NUMBER}"
         DOCKER_IMAGE = "${APP_NAME}:${APP_VERSION}"
@@ -110,13 +111,95 @@ else:
             }
         }
         
+        stage('Snyk Dependency Scan') {
+            steps {
+                script {
+                    echo 'Running Snyk dependency vulnerability scan...'
+                    withCredentials([string(credentialsId: 'snyk-api-token', variable: 'SNYK_TOKEN')]) {
+                        sh '''
+                            # Create reports directory
+                            mkdir -p snyk-reports
+                            
+                            # Run Snyk test for dependencies (will likely find vulnerabilities)
+                            echo "Running Snyk dependency scan..."
+                            docker run --rm \
+                                -e SNYK_TOKEN=${SNYK_TOKEN} \
+                                -v ${WORKSPACE}:/workspace \
+                                ${SNYK_IMAGE} snyk test /workspace \
+                                --file=/workspace/requirements.txt \
+                                --package-manager=pip \
+                                --severity-threshold=low \
+                                --json > snyk-reports/snyk-dependencies.json || echo "Snyk found vulnerabilities (expected)"
+                            
+                            # Generate readable report
+                            docker run --rm \
+                                -e SNYK_TOKEN=${SNYK_TOKEN} \
+                                -v ${WORKSPACE}:/workspace \
+                                ${SNYK_IMAGE} snyk test /workspace \
+                                --file=/workspace/requirements.txt \
+                                --package-manager=pip \
+                                --severity-threshold=low > snyk-reports/snyk-dependencies.txt || echo "Snyk found vulnerabilities (expected)"
+                            
+                            # Run Snyk monitor to record snapshot (optional)
+                            echo "Recording project snapshot in Snyk dashboard..."
+                            docker run --rm \
+                                -e SNYK_TOKEN=${SNYK_TOKEN} \
+                                -v ${WORKSPACE}:/workspace \
+                                ${SNYK_IMAGE} snyk monitor /workspace \
+                                --file=/workspace/requirements.txt \
+                                --package-manager=pip \
+                                --project-name="${JOB_NAME}-dependencies-${BUILD_NUMBER}" || echo "Monitor completed"
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('Snyk Container Scan') {
+            steps {
+                script {
+                    echo 'Running Snyk container vulnerability scan...'
+                    withCredentials([string(credentialsId: 'snyk-api-token', variable: 'SNYK_TOKEN')]) {
+                        sh '''
+                            # Run Snyk container test
+                            echo "Running Snyk container scan..."
+                            docker run --rm \
+                                -e SNYK_TOKEN=${SNYK_TOKEN} \
+                                -v /var/run/docker.sock:/var/run/docker.sock \
+                                -v ${WORKSPACE}:/workspace \
+                                ${SNYK_IMAGE} snyk container test ${DOCKER_IMAGE} \
+                                --severity-threshold=low \
+                                --json > snyk-reports/snyk-container.json || echo "Snyk found container vulnerabilities (expected)"
+                            
+                            # Generate readable container report
+                            docker run --rm \
+                                -e SNYK_TOKEN=${SNYK_TOKEN} \
+                                -v /var/run/docker.sock:/var/run/docker.sock \
+                                -v ${WORKSPACE}:/workspace \
+                                ${SNYK_IMAGE} snyk container test ${DOCKER_IMAGE} \
+                                --severity-threshold=low > snyk-reports/snyk-container.txt || echo "Snyk found container vulnerabilities (expected)"
+                            
+                            # Monitor container in Snyk dashboard
+                            echo "Recording container snapshot in Snyk dashboard..."
+                            docker run --rm \
+                                -e SNYK_TOKEN=${SNYK_TOKEN} \
+                                -v /var/run/docker.sock:/var/run/docker.sock \
+                                -v ${WORKSPACE}:/workspace \
+                                ${SNYK_IMAGE} snyk container monitor ${DOCKER_IMAGE} \
+                                --project-name="${JOB_NAME}-container-${BUILD_NUMBER}" || echo "Container monitor completed"
+                        '''
+                    }
+                }
+            }
+        }
+        
         stage('Trivy Security Scan') {
             steps {
                 script {
                     echo 'Running comprehensive Trivy security scan...'
                     
                     sh '''
-                        # Create reports directory
+                        # Create reports directory if not exists
                         mkdir -p trivy-reports
                         
                         # Run comprehensive Trivy scan
@@ -148,7 +231,7 @@ else:
                             ${DOCKER_IMAGE}
                         
                         # Create a summary report
-                        echo "=== VULNERABILITY SUMMARY ===" > trivy-reports/trivy-summary.txt
+                        echo "=== TRIVY VULNERABILITY SUMMARY ===" > trivy-reports/trivy-summary.txt
                         echo "Scan Date: $(date)" >> trivy-reports/trivy-summary.txt
                         echo "Image: ${DOCKER_IMAGE}" >> trivy-reports/trivy-summary.txt
                         echo "Git Commit: ${GIT_COMMIT}" >> trivy-reports/trivy-summary.txt
@@ -157,7 +240,7 @@ else:
                         
                         # Count vulnerabilities by severity
                         if [ -f trivy-reports/trivy-report.json ]; then
-                            echo "Parsing vulnerability counts..." >> trivy-reports/trivy-summary.txt
+                            echo "Parsing Trivy vulnerability counts..." >> trivy-reports/trivy-summary.txt
                             
                             # Count vulnerabilities by severity
                             CRITICAL_COUNT=$(grep -o '"Severity":"CRITICAL"' trivy-reports/trivy-report.json | wc -l || echo "0")
@@ -180,16 +263,64 @@ else:
             }
         }
         
+        stage('Parse Snyk Results') {
+            steps {
+                script {
+                    echo 'Parsing Snyk scan results...'
+                    sh '''
+                        # Create Snyk summary report
+                        echo "=== SNYK VULNERABILITY SUMMARY ===" > snyk-reports/snyk-summary.txt
+                        echo "Scan Date: $(date)" >> snyk-reports/snyk-summary.txt
+                        echo "Project: ${JOB_NAME}" >> snyk-reports/snyk-summary.txt
+                        echo "Build: ${BUILD_NUMBER}" >> snyk-reports/snyk-summary.txt
+                        echo "" >> snyk-reports/snyk-summary.txt
+                        
+                        # Parse dependency scan results
+                        if [ -f snyk-reports/snyk-dependencies.json ]; then
+                            echo "=== DEPENDENCY SCAN RESULTS ===" >> snyk-reports/snyk-summary.txt
+                            
+                            # Simple parsing of JSON results (basic approach)
+                            DEP_CRITICAL=$(grep -o '"severity":"critical"' snyk-reports/snyk-dependencies.json | wc -l || echo "0")
+                            DEP_HIGH=$(grep -o '"severity":"high"' snyk-reports/snyk-dependencies.json | wc -l || echo "0")
+                            DEP_MEDIUM=$(grep -o '"severity":"medium"' snyk-reports/snyk-dependencies.json | wc -l || echo "0")
+                            DEP_LOW=$(grep -o '"severity":"low"' snyk-reports/snyk-dependencies.json | wc -l || echo "0")
+                            
+                            echo "Dependencies - CRITICAL: $DEP_CRITICAL" >> snyk-reports/snyk-summary.txt
+                            echo "Dependencies - HIGH: $DEP_HIGH" >> snyk-reports/snyk-summary.txt
+                            echo "Dependencies - MEDIUM: $DEP_MEDIUM" >> snyk-reports/snyk-summary.txt
+                            echo "Dependencies - LOW: $DEP_LOW" >> snyk-reports/snyk-summary.txt
+                            echo "" >> snyk-reports/snyk-summary.txt
+                        fi
+                        
+                        # Parse container scan results
+                        if [ -f snyk-reports/snyk-container.json ]; then
+                            echo "=== CONTAINER SCAN RESULTS ===" >> snyk-reports/snyk-summary.txt
+                            
+                            CONT_CRITICAL=$(grep -o '"severity":"critical"' snyk-reports/snyk-container.json | wc -l || echo "0")
+                            CONT_HIGH=$(grep -o '"severity":"high"' snyk-reports/snyk-container.json | wc -l || echo "0")
+                            CONT_MEDIUM=$(grep -o '"severity":"medium"' snyk-reports/snyk-container.json | wc -l || echo "0")
+                            CONT_LOW=$(grep -o '"severity":"low"' snyk-reports/snyk-container.json | wc -l || echo "0")
+                            
+                            echo "Container - CRITICAL: $CONT_CRITICAL" >> snyk-reports/snyk-summary.txt
+                            echo "Container - HIGH: $CONT_HIGH" >> snyk-reports/snyk-summary.txt
+                            echo "Container - MEDIUM: $CONT_MEDIUM" >> snyk-reports/snyk-summary.txt
+                            echo "Container - LOW: $CONT_LOW" >> snyk-reports/snyk-summary.txt
+                        fi
+                    '''
+                }
+            }
+        }
+        
         stage('Security Gate - Evaluate Thresholds') {
             steps {
                 script {
-                    echo 'Evaluating security thresholds...'
+                    echo 'Evaluating security thresholds based on Trivy results...'
                     
                     def criticalCount = 0
                     def highCount = 0
                     def mediumCount = 0
                     
-                    // Read vulnerability counts
+                    // Read Trivy vulnerability counts for security gate
                     if (fileExists('trivy-reports/critical-count.txt')) {
                         criticalCount = readFile('trivy-reports/critical-count.txt').trim() as Integer
                     }
@@ -200,7 +331,7 @@ else:
                         mediumCount = readFile('trivy-reports/medium-count.txt').trim() as Integer
                     }
                     
-                    echo "Found vulnerabilities:"
+                    echo "Trivy found vulnerabilities:"
                     echo "  CRITICAL: ${criticalCount}"
                     echo "  HIGH: ${highCount}"
                     echo "  MEDIUM: ${mediumCount}"
@@ -230,7 +361,7 @@ else:
                     }
                     
                     // Write results to file
-                    writeFile file: 'trivy-reports/security-gate-result.txt', text: """
+                    writeFile file: 'security-gate-result.txt', text: """
 Security Gate Evaluation Result
 ==============================
 Date: ${new Date()}
@@ -239,7 +370,7 @@ Git Commit: ${env.GIT_COMMIT}
 Git Branch: ${env.GIT_BRANCH}
 Jenkins Build: #${env.BUILD_NUMBER}
 
-Vulnerability Counts:
+Trivy Vulnerability Counts:
 - CRITICAL: ${criticalCount} (Threshold: ${env.MAX_CRITICAL})
 - HIGH: ${highCount} (Threshold: ${env.MAX_HIGH})
 - MEDIUM: ${mediumCount} (Threshold: ${env.MAX_MEDIUM})
@@ -247,6 +378,9 @@ Vulnerability Counts:
 Security Gate: ${securityGatePassed ? 'PASSED' : 'FAILED'}
 
 ${failureReasons.size() > 0 ? 'Failure Reasons:\n' + failureReasons.collect{ '- ' + it }.join('\n') : 'All vulnerability counts are within acceptable thresholds.'}
+
+Note: Security gate evaluation is based on Trivy results. 
+Snyk results are provided for comparison and analysis purposes.
 """
                     
                     if (!securityGatePassed) {
@@ -265,16 +399,18 @@ ${failureReasons.size() > 0 ? 'Failure Reasons:\n' + failureReasons.collect{ '- 
             }
         }
         
-        stage('Generate HTML Report') {
+        stage('Generate Comparison Report') {
             steps {
                 script {
-                    // Create a comprehensive HTML report
+                    // Create comprehensive HTML report comparing both tools
                     sh '''
-                        cat > trivy-reports/trivy-report.html << 'EOF'
+                        mkdir -p comparison-reports
+                        
+                        cat > comparison-reports/sca-comparison-report.html << 'EOF'
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Trivy Vulnerability Scan Report</title>
+    <title>SCA Tools Comparison Report - Trivy vs Snyk</title>
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; }
         .header { background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin-bottom: 20px; }
@@ -284,15 +420,23 @@ ${failureReasons.size() > 0 ? 'Failure Reasons:\n' + failureReasons.collect{ '- 
         .low { color: #28a745; }
         .passed { color: #28a745; font-weight: bold; }
         .failed { color: #dc3545; font-weight: bold; }
-        pre { background-color: #f8f9fa; padding: 15px; border-radius: 5px; overflow-x: auto; }
+        pre { background-color: #f8f9fa; padding: 15px; border-radius: 5px; overflow-x: auto; font-size: 12px; }
         .info-table { width: 100%; border-collapse: collapse; margin: 20px 0; }
         .info-table th, .info-table td { padding: 8px 12px; text-align: left; border: 1px solid #dee2e6; }
         .info-table th { background-color: #e9ecef; }
+        .comparison-container { display: flex; gap: 20px; margin: 20px 0; }
+        .tool-section { flex: 1; border: 1px solid #dee2e6; border-radius: 5px; padding: 15px; }
+        .trivy-section { border-color: #007bff; }
+        .snyk-section { border-color: #6f42c1; }
+        h3.trivy { color: #007bff; }
+        h3.snyk { color: #6f42c1; }
+        .summary-box { background-color: #e9ecef; padding: 10px; border-radius: 5px; margin: 10px 0; }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>🛡️ Trivy Vulnerability Scan Report</h1>
+        <h1>🔍 SCA Tools Comparison Report</h1>
+        <h2>Trivy vs Snyk Vulnerability Analysis</h2>
         <table class="info-table">
             <tr><th>Image</th><td>vulnerable-python-app:${BUILD_NUMBER}</td></tr>
             <tr><th>Scan Date</th><td>$(date)</td></tr>
@@ -302,42 +446,97 @@ ${failureReasons.size() > 0 ? 'Failure Reasons:\n' + failureReasons.collect{ '- 
         </table>
     </div>
     
-    <h2>📊 Vulnerability Summary</h2>
+    <div class="comparison-container">
+        <div class="tool-section trivy-section">
+            <h3 class="trivy">🛡️ Trivy Results</h3>
+            <div class="summary-box">
+                <h4>Vulnerability Summary</h4>
 EOF
                         
                         if [ -f trivy-reports/trivy-summary.txt ]; then
-                            echo "<pre>" >> trivy-reports/trivy-report.html
-                            cat trivy-reports/trivy-summary.txt >> trivy-reports/trivy-report.html
-                            echo "</pre>" >> trivy-reports/trivy-report.html
+                            echo "<pre>" >> comparison-reports/sca-comparison-report.html
+                            cat trivy-reports/trivy-summary.txt >> comparison-reports/sca-comparison-report.html
+                            echo "</pre>" >> comparison-reports/sca-comparison-report.html
                         fi
                         
-                        echo "<h2>🚨 Critical & High Vulnerabilities</h2>" >> trivy-reports/trivy-report.html
-                        echo "<pre>" >> trivy-reports/trivy-report.html
-                        if [ -f trivy-reports/trivy-critical-high.txt ]; then
-                            cat trivy-reports/trivy-critical-high.txt >> trivy-reports/trivy-report.html
-                        else
-                            echo "No CRITICAL or HIGH vulnerabilities found." >> trivy-reports/trivy-report.html
-                        fi
-                        echo "</pre>" >> trivy-reports/trivy-report.html
-                        
-                        echo "<h2>📋 Security Gate Result</h2>" >> trivy-reports/trivy-report.html
-                        echo "<pre>" >> trivy-reports/trivy-report.html
-                        if [ -f trivy-reports/security-gate-result.txt ]; then
-                            cat trivy-reports/security-gate-result.txt >> trivy-reports/trivy-report.html
-                        fi
-                        echo "</pre>" >> trivy-reports/trivy-report.html
-                        
-                        cat >> trivy-reports/trivy-report.html << 'EOF'
-    <h2>📄 Full Scan Report</h2>
-    <pre id="full-report">
+                        cat >> comparison-reports/sca-comparison-report.html << 'EOF'
+            </div>
+        </div>
+        
+        <div class="tool-section snyk-section">
+            <h3 class="snyk">🔐 Snyk Results</h3>
+            <div class="summary-box">
+                <h4>Vulnerability Summary</h4>
 EOF
                         
-                        if [ -f trivy-reports/trivy-detailed-report.txt ]; then
-                            cat trivy-reports/trivy-detailed-report.txt >> trivy-reports/trivy-report.html
+                        if [ -f snyk-reports/snyk-summary.txt ]; then
+                            echo "<pre>" >> comparison-reports/sca-comparison-report.html
+                            cat snyk-reports/snyk-summary.txt >> comparison-reports/sca-comparison-report.html
+                            echo "</pre>" >> comparison-reports/sca-comparison-report.html
                         fi
                         
-                        cat >> trivy-reports/trivy-report.html << 'EOF'
+                        cat >> comparison-reports/sca-comparison-report.html << 'EOF'
+            </div>
+        </div>
+    </div>
+    
+    <h2>📊 Security Gate Results</h2>
+    <div class="summary-box">
+EOF
+                        
+                        if [ -f security-gate-result.txt ]; then
+                            echo "<pre>" >> comparison-reports/sca-comparison-report.html
+                            cat security-gate-result.txt >> comparison-reports/sca-comparison-report.html
+                            echo "</pre>" >> comparison-reports/sca-comparison-report.html
+                        fi
+                        
+                        cat >> comparison-reports/sca-comparison-report.html << 'EOF'
+    </div>
+    
+    <h2>🔍 Detailed Analysis</h2>
+    
+    <h3 class="trivy">Trivy - Container & OS Package Vulnerabilities</h3>
+    <pre>
+EOF
+                        
+                        if [ -f trivy-reports/trivy-critical-high.txt ]; then
+                            head -50 trivy-reports/trivy-critical-high.txt >> comparison-reports/sca-comparison-report.html
+                            echo "... (truncated for brevity)" >> comparison-reports/sca-comparison-report.html
+                        fi
+                        
+                        cat >> comparison-reports/sca-comparison-report.html << 'EOF'
     </pre>
+    
+    <h3 class="snyk">Snyk - Dependency Vulnerabilities</h3>
+    <pre>
+EOF
+                        
+                        if [ -f snyk-reports/snyk-dependencies.txt ]; then
+                            head -50 snyk-reports/snyk-dependencies.txt >> comparison-reports/sca-comparison-report.html
+                            echo "... (truncated for brevity)" >> comparison-reports/sca-comparison-report.html
+                        fi
+                        
+                        cat >> comparison-reports/sca-comparison-report.html << 'EOF'
+    </pre>
+    
+    <h2>🔧 Tool Comparison Summary</h2>
+    <div class="summary-box">
+        <h4>Key Differences:</h4>
+        <ul>
+            <li><strong>Trivy</strong>: Container-focused, scans OS packages + application dependencies</li>
+            <li><strong>Snyk</strong>: Developer-focused, provides detailed fix recommendations</li>
+            <li><strong>Coverage</strong>: Different vulnerability databases may show different results</li>
+            <li><strong>Remediation</strong>: Snyk typically provides more actionable fix guidance</li>
+        </ul>
+    </div>
+    
+    <h2>📋 Raw Reports</h2>
+    <p>Download the complete raw reports from Jenkins build artifacts:</p>
+    <ul>
+        <li>Trivy JSON Report: trivy-reports/trivy-report.json</li>
+        <li>Snyk Dependencies JSON: snyk-reports/snyk-dependencies.json</li>
+        <li>Snyk Container JSON: snyk-reports/snyk-container.json</li>
+    </ul>
 </body>
 </html>
 EOF
@@ -348,21 +547,33 @@ EOF
         
         stage('Archive Reports & Publish') {
             steps {
-                // Archive all reports
-                archiveArtifacts artifacts: 'trivy-reports/*', fingerprint: true, allowEmptyArchive: false
+                // Archive all reports from both tools
+                archiveArtifacts artifacts: 'trivy-reports/*,snyk-reports/*,comparison-reports/*,security-gate-result.txt', fingerprint: true, allowEmptyArchive: false
                 
-                // Publish HTML report
+                // Publish comparison report
+                publishHTML([
+                    allowMissing: false,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true,
+                    reportDir: 'comparison-reports',
+                    reportFiles: 'sca-comparison-report.html',
+                    reportName: 'SCA Comparison Report',
+                    reportTitles: 'Trivy vs Snyk Analysis'
+                ])
+                
+                // Publish individual Trivy report for backward compatibility
                 publishHTML([
                     allowMissing: false,
                     alwaysLinkToLastBuild: true,
                     keepAll: true,
                     reportDir: 'trivy-reports',
-                    reportFiles: 'trivy-report.html',
+                    reportFiles: 'trivy-detailed-report.txt',
                     reportName: 'Trivy Security Report',
-                    reportTitles: 'Vulnerability Scan Results'
+                    reportTitles: 'Trivy Vulnerability Scan Results'
                 ])
                 
-                echo 'Reports published successfully! Check the "Trivy Security Report" link in the build.'
+                echo 'Reports published successfully!'
+                echo 'Check the "SCA Comparison Report" link for side-by-side tool comparison'
             }
         }
     }
@@ -371,15 +582,28 @@ EOF
         always {
             // Display summary in console
             script {
+                echo "\n" + "="*50
+                echo "FINAL SCAN SUMMARY"
+                echo "="*50
+                
                 if (fileExists('trivy-reports/trivy-summary.txt')) {
-                    echo "\n=== FINAL VULNERABILITY SUMMARY ==="
+                    echo "\n=== TRIVY RESULTS ==="
                     sh 'cat trivy-reports/trivy-summary.txt'
                 }
                 
-                if (fileExists('trivy-reports/security-gate-result.txt')) {
-                    echo "\n=== SECURITY GATE RESULT ==="
-                    sh 'cat trivy-reports/security-gate-result.txt'
+                if (fileExists('snyk-reports/snyk-summary.txt')) {
+                    echo "\n=== SNYK RESULTS ==="
+                    sh 'cat snyk-reports/snyk-summary.txt'
                 }
+                
+                if (fileExists('security-gate-result.txt')) {
+                    echo "\n=== SECURITY GATE RESULT ==="
+                    sh 'cat security-gate-result.txt'
+                }
+                
+                echo "\n" + "="*50
+                echo "Check the 'SCA Comparison Report' in Jenkins for detailed analysis"
+                echo "="*50
             }
             
             // Clean up Docker images to save space
@@ -390,7 +614,7 @@ EOF
             '''
         }
         success {
-            echo '✅ Pipeline completed successfully - Security reports available'
+            echo '✅ Pipeline completed successfully - Comparison reports available'
         }
         failure {
             echo '❌ Pipeline failed - Check security reports for details'
